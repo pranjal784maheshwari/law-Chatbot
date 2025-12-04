@@ -1,201 +1,179 @@
-# -------------------------
-# IMPORTS + ENV
-# -------------------------
+# chatbot.py
 from dotenv import load_dotenv
 load_dotenv()
 
 import os
-import requests
-import pickle
 import numpy as np
+from typing import List, Tuple
 from bs4 import BeautifulSoup
-from ddgs import DDGS
+import requests
 from openai import OpenAI
+from chunk_and_index import load_faiss_index, get_embedding
+import faiss
 
-# Initialize OpenAI
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-INDEX_DIR = "index_data"
-
-# -------------------------
-# 1. LEGAL QUESTION CHECK
-# -------------------------
-LEGAL_KEYWORDS = [
-    "law","legal","act","section","article","ipc","crpc",
-    "right","penalty","offence","court","case","rights",
-    "constitution","government","regulation","crime","justice"
-]
-
-def is_legal_question(question: str) -> bool:
-    """Return True if question is legal."""
-    if any(k in question.lower() for k in LEGAL_KEYWORDS):
-        return True
-    
-    prompt = f"Answer YES or NO only. Is this a legal question?\nQuestion: {question}"
-    res = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return res.choices[0].message.content.strip().lower().startswith("y")
+client = OpenAI()
 
 
-# -------------------------
-# 2. PDF SEARCH (FAISS)
-# -------------------------
-def load_faiss_index():
-    import faiss
-    index_path = os.path.join(INDEX_DIR, "faiss.index")
-    meta_path  = os.path.join(INDEX_DIR, "metadata.pkl")
-
-    if not os.path.exists(index_path) or not os.path.exists(meta_path):
-        return None, None
-    
-    index = faiss.read_index(index_path)
-    with open(meta_path, "rb") as f:
-        metadata = pickle.load(f)
-    return index, metadata
-
-
-def search_pdf(question: str, top_k=5, threshold=0.6):
-    index, metadata = load_faiss_index()
+# ---------------------------------------------------------
+# 1. PDF Search (FAISS)
+# ---------------------------------------------------------
+def search_pdf_index(query: str, top_k: int = 3) -> List[Tuple[str, float]]:
+    index, metadata = load_faiss_index("index_data")
     if index is None:
-        return None
-    
-    from chunk_and_index import get_embedding
-    q_emb = np.array([get_embedding(question)], dtype=np.float32)
-    
-    distances, indices = index.search(q_emb, top_k)
+        return []
+
+    emb = get_embedding(query).astype(np.float32).reshape(1, -1)
+    distances, idxs = index.search(emb, top_k)
+
     results = []
+    for dist, idx in zip(distances[0], idxs[0]):
+        if idx == -1:
+            continue
+        results.append((metadata[idx]["text"], float(dist)))
 
-    for dist, idx in zip(distances[0], indices[0]):
-        if dist < threshold and 0 <= idx < len(metadata):
-            results.append(metadata[idx]["text"])
-
-    return "\n".join(results) if results else None
-
-
-# -------------------------
-# 3. KEYWORD EXTRACTION
-# -------------------------
-def extract_keyword(question: str):
-    prompt = f"Extract ONE keyword from this legal question:\n{question}\nKeyword:"
-    res = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return res.choices[0].message.content.strip().replace(" ", "_")
+    return results
 
 
-# -------------------------
-# 4. SCRAPE TRUSTED SOURCES
-# -------------------------
-TRUSTED_DOMAINS = [
-    "incometaxindia.gov.in",
-    "cbic.gov.in",
-    "mca.gov.in",
-    "rbi.org.in",
-    "indiankanoon.org",
-    "ibbi.gov.in",
-    "indiacode.nic.in",
-    "legislative.gov.in"
-]
+# ---------------------------------------------------------
+# 2. Web Scraper (BeautifulSoup)
+# ---------------------------------------------------------
+def scrape_definition_from_web(query: str) -> str:
+    query_clean = query.replace(" ", "+")
 
-def scrape_trusted_sources(keyword: str):
-    print(f"[DEBUG] Searching trusted legal sites for: {keyword}")
-
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
-    }
-
-    SEARCH_URLS = [
-        # IndiaCode search
-        f"https://www.indiacode.nic.in/search?searchtype=1&text={keyword}",
-
-        # Legislative.gov search
-        f"https://www.legislative.gov.in/search/site/{keyword}",
-
-        # IndiaKanoon direct search
-        f"https://indiankanoon.org/search/?formInput={keyword}",
-
-        # IPC (Old Code) – definitions
-        f"https://indiacode.nic.in/show-data?actid=AC_CEN_5_23_00045_186045_1517807325716&sectionId=95&sectionno=1&orderno=1",
-
-        # CrPC
-        f"https://indiacode.nic.in/handle/123456789/2263?view_type=browse&sam_handle=123456789/1362"
+    urls = [
+        f"https://indiankanoon.org/search/?formInput={query_clean}",
+        f"https://www.latestlaws.com/search/?q={query_clean}",
     ]
 
-    for url in SEARCH_URLS:
-        print(f"[DEBUG] Trying: {url}")
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    for url in urls:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=8)
+            print(f"[DEBUG] Scraping: {url}")
+            r = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
 
-            if r.status_code not in [200, 302]:
-                print(f"[DEBUG] Status {r.status_code} for {url}")
-                continue
+            # IndiaKanoon snippets
+            snippets = soup.select(".snippet")
+            if snippets:
+                text = " ".join(s.get_text(" ", strip=True) for s in snippets)
+                if len(text) > 80:
+                    return text
 
-            soup = BeautifulSoup(r.content, "html.parser")
+            # Paragraphs
+            paragraphs = soup.find_all("p")
+            if paragraphs:
+                text = " ".join(p.get_text(" ", strip=True) for p in paragraphs)
+                if len(text) > 80:
+                    return text
 
-            # Extract large paragraphs
-            paras = soup.find_all("p")
-            text = "\n".join(
-                p.get_text().strip()
-                for p in paras
-                if len(p.get_text().strip()) > 40
-            )
-
-            if len(text) > 150:
-                print("[DEBUG] Extracted content from:", url)
+            # Div blocks
+            divs = soup.find_all("div")
+            text = " ".join(d.get_text(" ", strip=True) for d in divs)
+            if len(text) > 80:
                 return text
 
         except Exception as e:
-            print(f"[DEBUG] Error fetching {url}: {e}")
+            print("[DEBUG] Scraping error:", e)
 
-    print("[DEBUG] No trusted source returned text.")
-    return None
-
+    return ""
 
 
-# -------------------------
-# 5. LLM ANSWER
-# -------------------------
-def answer_with_llm(context: str, question: str):
-    prompt = f"Use ONLY the text below.\nQUESTION: {question}\nTEXT:\n{context}\nAnswer:"
+# ---------------------------------------------------------
+# 3A. LLM Answer using PDF context (STRICT — PDF ONLY)
+# ---------------------------------------------------------
+def answer_from_pdf(query: str, context: str) -> str:
+    prompt = f"""
+You are a legal assistant. You MUST answer the user's question
+using ONLY the text provided in the context below.
+
+If the context does NOT contain the answer,
+respond EXACTLY with: "NOT_FOUND".
+
+QUESTION:
+{query}
+
+CONTEXT:
+{context}
+    """
+
     res = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
     )
+
     return res.choices[0].message.content.strip()
 
 
-# -------------------------
-# 6. MAIN AGENT
-# -------------------------
-def legal_agent(question: str):
-    if not is_legal_question(question):
-        return "I can only answer legal questions."
+# ---------------------------------------------------------
+# 3B. LLM Final Answer using Web Text (FLEXIBLE)
+# ---------------------------------------------------------
+def answer_from_web(query: str, scraped_text: str) -> str:
+    prompt = f"""
+You are a legal assistant.
 
-    pdf_context = search_pdf(question)
-    if pdf_context:
-        return answer_with_llm(pdf_context, question)
+QUESTION:
+{query}
 
-    keyword = extract_keyword(question)
-    web_context = scrape_trusted_sources(keyword)
-    if web_context:
-        return answer_with_llm(web_context, question)
+You may use the scraped text for reference, but you CAN answer from
+general legal knowledge if needed.
 
-    return "Information not available."
+SCRAPED TEXT:
+{scraped_text}
+    """
+
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    return res.choices[0].message.content.strip()
 
 
-# -------------------------
-# 7. CLI LOOP
-# -------------------------
+# ---------------------------------------------------------
+# 4. Main QA Logic (PDF → Web Fallback)
+# ---------------------------------------------------------
+def ask_question(query: str) -> str:
+    print("=== 🔍 Law Chatbot (PDF-first + Web Fallback) ===")
+
+    # 1 — Search PDF index
+    pdf_hits_raw = search_pdf_index(query)
+
+    if pdf_hits_raw:
+        print(f"[DEBUG] {len(pdf_hits_raw)} PDF chunks found")
+        # Log distances for debugging
+        for i, (text, dist) in enumerate(pdf_hits_raw):
+            print(f"[DEBUG] Chunk {i} distance: {dist}")
+
+        # Use all top-k chunks, ignoring strict distance threshold
+        pdf_context = "\n\n".join([t for t, _ in pdf_hits_raw])
+        pdf_answer = answer_from_pdf(query, pdf_context)
+
+        if pdf_answer != "NOT_FOUND":
+            return pdf_answer
+        else:
+            print("[DEBUG] PDF did not contain the answer → Web fallback")
+    else:
+        print("[DEBUG] No PDF chunks found → Web fallback")
+
+    # 2 — Web fallback
+    print("[DEBUG] Searching web...")
+    scraped = scrape_definition_from_web(query)
+
+    if scraped.strip():
+        return answer_from_web(query, scraped)
+
+    return "No information available."
+
+
+# ---------------------------------------------------------
+# 5. CLI
+# ---------------------------------------------------------
 if __name__ == "__main__":
-    print("\n=== 🔍 Law Chatbot (Trusted sources + PDF-first) Ready ===\n")
     while True:
-        q = input("Ask your question: ").strip()
+        q = input("\nAsk your question: ")
         if q.lower() in ["exit", "quit"]:
             break
-        
+
         print("\n--- ANSWER ---\n")
-        print(legal_agent(q))
-        print("\n----------------\n")
+        print(ask_question(q))
