@@ -1,0 +1,22 @@
+User Question
+      ↓
+Rule Check: Is it a legal question?
+      ↓ Yes
+PDF Search → If found → Pass text to LLM → Generate answer
+      ↓ No result
+Web Scrape (BeautifulSoup) → Extract text → Pass text to LLM → Generate answer
+      ↓ No result
+Return: "Information not available"
+
+
+PDF search comes first.
+
+If nothing found, extract keywords from the question.
+
+Use those keywords to fetch a relevant web page.
+
+Extract the text with BeautifulSoup.
+
+Pass it to the LLM to generate an answer.
+
+If still nothing, return "Information not available"
