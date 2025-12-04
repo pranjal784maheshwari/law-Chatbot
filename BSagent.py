@@ -138,34 +138,62 @@ SCRAPED TEXT:
 def ask_question(query: str) -> str:
     print("=== 🔍 Law Chatbot (PDF-first + Web Fallback) ===")
 
-    # 1 — Search PDF index
+    # PDF-first logic
     pdf_hits_raw = search_pdf_index(query)
+    answer = None
 
     if pdf_hits_raw:
         print(f"[DEBUG] {len(pdf_hits_raw)} PDF chunks found")
         for i, (text, dist) in enumerate(pdf_hits_raw):
             print(f"[DEBUG] Chunk {i} distance: {dist}")
 
-        # Check each chunk individually
         for chunk, _ in pdf_hits_raw:
             pdf_answer = answer_from_pdf(query, chunk)
             if pdf_answer != "NOT_FOUND":
                 print("[DEBUG] Answer found in PDF chunk")
-                return pdf_answer
+                answer = pdf_answer
+                break
 
-        print("[DEBUG] PDF chunks scanned, but answer not found → Web fallback")
-    else:
-        print("[DEBUG] No PDF chunks found → Web fallback")
+    if not answer:
+        print("[DEBUG] Searching web...")
+        scraped = scrape_definition_from_web(query)
+        if scraped.strip():
+            answer = answer_from_web(query, scraped)
+        else:
+            answer = "No information available."
 
-    # 2 — Web fallback only if PDF fails
-    print("[DEBUG] Searching web...")
-    scraped = scrape_definition_from_web(query)
+    # Generate follow-up suggestions
+    followups = suggest_followups(answer, query)
+    if followups:
+        answer += "\n\n💡 You might also ask:\n" + "\n".join(f"- " + q for q in followups)
 
-    if scraped.strip():
-        return answer_from_web(query, scraped)
+    return answer
 
-    return "No information available."
 
+def suggest_followups(answer: str, query: str, max_suggestions: int = 3) -> list[str]:
+    """
+    Generate suggested follow-up questions based on the answer.
+    """
+    prompt = f"""
+You are a legal assistant. The user just asked: "{query}".
+You provided this answer:
+
+{answer}
+
+Suggest up to {max_suggestions} follow-up questions the user might ask next about this topic.
+Provide each suggestion as a short, clear question.
+Return only the questions in a list.
+"""
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    # Extract text and split into lines
+    suggestions_text = res.choices[0].message.content.strip()
+    # Split by newlines or numbers/dashes
+    suggestions = [line.strip("- ").strip() for line in suggestions_text.split("\n") if line.strip()]
+    return suggestions[:max_suggestions]
 
 
 
