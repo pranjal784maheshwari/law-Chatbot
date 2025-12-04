@@ -10,7 +10,7 @@ from openai import OpenAI
 
 client = OpenAI()
 
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+def chunk_text(text: str, chunk_size: int = 700, overlap: int = 150) -> List[str]:
     text = text.replace("\r\n", "\n")
     chunks = []
     start = 0

@@ -84,25 +84,27 @@ def scrape_definition_from_web(query: str) -> str:
 # ---------------------------------------------------------
 def answer_from_pdf(query: str, context: str) -> str:
     prompt = f"""
-You are a legal assistant. You MUST answer the user's question
-using ONLY the text provided in the context below.
-
-If the context does NOT contain the answer,
-respond EXACTLY with: "NOT_FOUND".
+You are a legal assistant. Use ONLY the text provided below to answer the user's question.
+If the answer is present, extract or summarize it clearly.
+If the answer is not present, respond with "NOT_FOUND".
 
 QUESTION:
 {query}
 
-CONTEXT:
+PDF CONTEXT:
 {context}
-    """
 
+Instructions:
+- Answer concisely and accurately using only the PDF text.
+- Do not guess or invent details.
+- Extract the most relevant part of the text if it exists.
+"""
     res = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
     )
-
     return res.choices[0].message.content.strip()
+
 
 
 # ---------------------------------------------------------
@@ -141,22 +143,21 @@ def ask_question(query: str) -> str:
 
     if pdf_hits_raw:
         print(f"[DEBUG] {len(pdf_hits_raw)} PDF chunks found")
-        # Log distances for debugging
         for i, (text, dist) in enumerate(pdf_hits_raw):
             print(f"[DEBUG] Chunk {i} distance: {dist}")
 
-        # Use all top-k chunks, ignoring strict distance threshold
-        pdf_context = "\n\n".join([t for t, _ in pdf_hits_raw])
-        pdf_answer = answer_from_pdf(query, pdf_context)
+        # Check each chunk individually
+        for chunk, _ in pdf_hits_raw:
+            pdf_answer = answer_from_pdf(query, chunk)
+            if pdf_answer != "NOT_FOUND":
+                print("[DEBUG] Answer found in PDF chunk")
+                return pdf_answer
 
-        if pdf_answer != "NOT_FOUND":
-            return pdf_answer
-        else:
-            print("[DEBUG] PDF did not contain the answer → Web fallback")
+        print("[DEBUG] PDF chunks scanned, but answer not found → Web fallback")
     else:
         print("[DEBUG] No PDF chunks found → Web fallback")
 
-    # 2 — Web fallback
+    # 2 — Web fallback only if PDF fails
     print("[DEBUG] Searching web...")
     scraped = scrape_definition_from_web(query)
 
@@ -164,6 +165,8 @@ def ask_question(query: str) -> str:
         return answer_from_web(query, scraped)
 
     return "No information available."
+
+
 
 
 # ---------------------------------------------------------
